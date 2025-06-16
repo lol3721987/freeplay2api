@@ -157,15 +157,19 @@ export async function* generateOpenAIStreamResponse(
   messages: ChatMessage[],
   model: string = "claude-3-7-sonnet-20250219"
 ): AsyncGenerator<string, void, unknown> {
+  console.log(`[STREAM] 开始生成流式响应，模型: ${model}`);
+
   try {
     const [response, account] = await callFreeplayAPIWithRetry(accountPool, messages, true, model);
     const chatId = `chatcmpl-${crypto.randomUUID().replace(/-/g, '').substring(0, 29)}`;
     const created = Math.floor(Date.now() / 1000);
 
-    console.log(`使用账号: ${account.email} (余额: $${account.balance.toFixed(2)})`);
+    console.log(`[STREAM] 使用账号: ${account.email} (余额: $${account.balance.toFixed(2)})`);
+    console.log(`[STREAM] 响应状态: ${response.status}, Content-Type: ${response.headers.get('content-type')}`);
 
     // 检查响应状态
     if (response.status !== 200) {
+      console.log(`[STREAM] API错误，状态码: ${response.status}`);
       const errorChunk = {
         error: {
           message: `FreePlay API error: ${response.status}`,
@@ -188,96 +192,153 @@ export async function* generateOpenAIStreamResponse(
         finish_reason: null
       }]
     };
+    console.log(`[STREAM] 发送开始chunk`);
     yield `data: ${JSON.stringify(startChunk)}\n\n`;
 
     // 处理流式数据
-    if (response.body) {
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
+    if (!response.body) {
+      console.log(`[STREAM] 警告: 响应体为空`);
+      const endChunk = {
+        id: chatId,
+        object: "chat.completion.chunk",
+        created: created,
+        model: model,
+        choices: [{
+          index: 0,
+          delta: {},
+          finish_reason: "stop"
+        }]
+      };
+      yield `data: ${JSON.stringify(endChunk)}\n\n`;
+      yield "data: [DONE]\n\n";
+      return;
+    }
 
-          const chunk = decoder.decode(value, { stream: true });
-          const lines = chunk.split('\n');
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let buffer = '';
+    let chunkCount = 0;
 
-          for (const line of lines) {
-            if (line && line.startsWith('data: ')) {
-              try {
-                const freeplayData = JSON.parse(line.substring(6)); // 去掉 'data: ' 前缀
+    console.log(`[STREAM] 开始读取流式数据`);
 
-                // 检查错误
-                if (freeplayData.error) {
-                  const errorChunk = {
-                    error: {
-                      message: freeplayData.error,
-                      type: "api_error"
-                    }
-                  };
-                  yield `data: ${JSON.stringify(errorChunk)}\n\n`;
-                  return;
-                }
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
 
-                // 处理内容
-                if (freeplayData.content) {
-                  const contentChunk = {
-                    id: chatId,
-                    object: "chat.completion.chunk",
-                    created: created,
-                    model: model,
-                    choices: [{
-                      index: 0,
-                      delta: { content: freeplayData.content },
-                      finish_reason: null
-                    }]
-                  };
-                  yield `data: ${JSON.stringify(contentChunk)}\n\n`;
-                }
+        if (done) {
+          console.log(`[STREAM] 流读取完成，共处理 ${chunkCount} 个数据块`);
+          break;
+        }
 
-                // 检查是否结束（cost字段表示结束）
-                if (freeplayData.cost !== undefined) {
-                  // 对话结束后重新获取最新余额
-                  console.log(`对话结束，重新获取账号 ${account.email} 的最新余额...`);
-                  await accountPool.updateAccountBalance(account);
-                  // 保存更新后的账号信息
-                  await accountPool.saveAccounts();
+        chunkCount++;
+        const chunk = decoder.decode(value, { stream: true });
+        buffer += chunk;
 
-                  // 检查余额是否不足，如果不足则提示下次会切换账号
-                  if (account.balance <= 0.01) {
-                    console.log(`账号 ${account.email} 余额不足 ($${account.balance.toFixed(4)})，下次请求将自动切换到下一个账号`);
-                  }
+        console.log(`[STREAM] 收到数据块 ${chunkCount}, 大小: ${value.length} 字节`);
 
-                  const endChunk = {
-                    id: chatId,
-                    object: "chat.completion.chunk",
-                    created: created,
-                    model: model,
-                    choices: [{
-                      index: 0,
-                      delta: {},
-                      finish_reason: "stop"
-                    }]
-                  };
-                  yield `data: ${JSON.stringify(endChunk)}\n\n`;
-                  yield "data: [DONE]\n\n";
-                  return;
-                }
+        // 按行处理数据
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || ''; // 保留最后一个不完整的行
 
-              } catch (error) {
-                console.log(`JSON decode error: ${error}, line: ${line}`);
+        for (const line of lines) {
+          const trimmedLine = line.trim();
+          if (!trimmedLine) continue;
+
+          console.log(`[STREAM] 处理行: ${trimmedLine.substring(0, 100)}${trimmedLine.length > 100 ? '...' : ''}`);
+
+          if (trimmedLine.startsWith('data: ')) {
+            try {
+              const dataContent = trimmedLine.substring(6); // 去掉 'data: ' 前缀
+
+              if (dataContent === '[DONE]') {
+                console.log(`[STREAM] 收到结束标记`);
                 continue;
               }
+
+              const freeplayData = JSON.parse(dataContent);
+              console.log(`[STREAM] 解析数据成功:`, Object.keys(freeplayData));
+
+              // 检查错误
+              if (freeplayData.error) {
+                console.log(`[STREAM] API返回错误: ${freeplayData.error}`);
+                const errorChunk = {
+                  error: {
+                    message: freeplayData.error,
+                    type: "api_error"
+                  }
+                };
+                yield `data: ${JSON.stringify(errorChunk)}\n\n`;
+                return;
+              }
+
+              // 处理内容
+              if (freeplayData.content) {
+                console.log(`[STREAM] 发送内容块: ${freeplayData.content.length} 字符`);
+                const contentChunk = {
+                  id: chatId,
+                  object: "chat.completion.chunk",
+                  created: created,
+                  model: model,
+                  choices: [{
+                    index: 0,
+                    delta: { content: freeplayData.content },
+                    finish_reason: null
+                  }]
+                };
+                yield `data: ${JSON.stringify(contentChunk)}\n\n`;
+              }
+
+              // 检查是否结束（cost字段表示结束）
+              if (freeplayData.cost !== undefined) {
+                console.log(`[STREAM] 对话结束，成本: ${freeplayData.cost}`);
+
+                // 对话结束后重新获取最新余额
+                console.log(`对话结束，重新获取账号 ${account.email} 的最新余额...`);
+                await accountPool.updateAccountBalance(account);
+                // 保存更新后的账号信息
+                await accountPool.saveAccounts();
+
+                // 检查余额是否不足，如果不足则提示下次会切换账号
+                if (account.balance <= 0.01) {
+                  console.log(`账号 ${account.email} 余额不足 ($${account.balance.toFixed(4)})，下次请求将自动切换到下一个账号`);
+                }
+
+                const endChunk = {
+                  id: chatId,
+                  object: "chat.completion.chunk",
+                  created: created,
+                  model: model,
+                  choices: [{
+                    index: 0,
+                    delta: {},
+                    finish_reason: "stop"
+                  }]
+                };
+                console.log(`[STREAM] 发送结束chunk`);
+                yield `data: ${JSON.stringify(endChunk)}\n\n`;
+                yield "data: [DONE]\n\n";
+                return;
+              }
+
+            } catch (error) {
+              console.log(`[STREAM] JSON解析错误: ${error}, 行内容: ${trimmedLine}`);
+              continue;
             }
           }
         }
-      } finally {
-        reader.releaseLock();
       }
+    } finally {
+      reader.releaseLock();
+      console.log(`[STREAM] 释放读取器锁`);
+    }
+
+    // 处理缓冲区中剩余的数据
+    if (buffer.trim()) {
+      console.log(`[STREAM] 处理缓冲区剩余数据: ${buffer.trim()}`);
     }
 
     // 如果没有正常结束，发送结束chunk
+    console.log(`[STREAM] 发送默认结束chunk`);
     const endChunk = {
       id: chatId,
       object: "chat.completion.chunk",
@@ -293,7 +354,8 @@ export async function* generateOpenAIStreamResponse(
     yield "data: [DONE]\n\n";
 
   } catch (error) {
-    console.log(`Stream error: ${error}`);
+    console.error(`[STREAM] 流处理错误: ${error}`);
+    console.error(`[STREAM] 错误堆栈: ${error.stack}`);
     const errorChunk = {
       error: {
         message: `Stream processing error: ${error}`,
@@ -312,13 +374,17 @@ export async function generateOpenAINonStreamResponse(
   messages: ChatMessage[],
   model: string = "claude-3-7-sonnet-20250219"
 ): Promise<any> {
+  console.log(`[NON-STREAM] 开始生成非流式响应，模型: ${model}`);
+
   try {
     const [response, account] = await callFreeplayAPIWithRetry(accountPool, messages, false, model);
 
-    console.log(`使用账号: ${account.email} (余额: $${account.balance.toFixed(2)})`);
+    console.log(`[NON-STREAM] 使用账号: ${account.email} (余额: $${account.balance.toFixed(2)})`);
+    console.log(`[NON-STREAM] 响应状态: ${response.status}, Content-Type: ${response.headers.get('content-type')}`);
 
     // 检查响应状态
     if (response.status !== 200) {
+      console.log(`[NON-STREAM] API错误，状态码: ${response.status}`);
       return {
         error: {
           message: `FreePlay API error: ${response.status}`,
@@ -330,50 +396,109 @@ export async function generateOpenAINonStreamResponse(
     // 收集所有内容
     let fullContent = "";
     let cost = null;
+    let chunkCount = 0;
 
-    if (response.body) {
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
+    if (!response.body) {
+      console.log(`[NON-STREAM] 警告: 响应体为空`);
+      return {
+        id: `chatcmpl-${crypto.randomUUID().replace(/-/g, '').substring(0, 29)}`,
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: model,
+        choices: [{
+          index: 0,
+          message: {
+            role: "assistant",
+            content: ""
+          },
+          finish_reason: "stop"
+        }],
+        usage: {
+          prompt_tokens: 0,
+          completion_tokens: 0,
+          total_tokens: 0
+        }
+      };
+    }
 
-          const chunk = decoder.decode(value, { stream: true });
-          const lines = chunk.split('\n');
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let buffer = '';
 
-          for (const line of lines) {
-            if (line && line.startsWith('data: ')) {
-              try {
-                const freeplayData = JSON.parse(line.substring(6));
+    console.log(`[NON-STREAM] 开始读取流式数据`);
 
-                if (freeplayData.error) {
-                  return {
-                    error: {
-                      message: freeplayData.error,
-                      type: "api_error"
-                    }
-                  };
-                }
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          console.log(`[NON-STREAM] 流读取完成，共处理 ${chunkCount} 个数据块`);
+          break;
+        }
 
-                if (freeplayData.content) {
-                  fullContent += freeplayData.content;
-                }
-                if (freeplayData.cost !== undefined) {
-                  cost = freeplayData.cost;
-                }
+        chunkCount++;
+        const chunk = decoder.decode(value, { stream: true });
+        buffer += chunk;
 
-              } catch {
+        console.log(`[NON-STREAM] 收到数据块 ${chunkCount}, 大小: ${value.length} 字节`);
+
+        // 按行处理数据
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || ''; // 保留最后一个不完整的行
+
+        for (const line of lines) {
+          const trimmedLine = line.trim();
+          if (!trimmedLine) continue;
+
+          if (trimmedLine.startsWith('data: ')) {
+            try {
+              const dataContent = trimmedLine.substring(6);
+
+              if (dataContent === '[DONE]') {
+                console.log(`[NON-STREAM] 收到结束标记`);
                 continue;
               }
+
+              const freeplayData = JSON.parse(dataContent);
+              console.log(`[NON-STREAM] 解析数据成功:`, Object.keys(freeplayData));
+
+              if (freeplayData.error) {
+                console.log(`[NON-STREAM] API返回错误: ${freeplayData.error}`);
+                return {
+                  error: {
+                    message: freeplayData.error,
+                    type: "api_error"
+                  }
+                };
+              }
+
+              if (freeplayData.content) {
+                console.log(`[NON-STREAM] 收集内容: ${freeplayData.content.length} 字符`);
+                fullContent += freeplayData.content;
+              }
+
+              if (freeplayData.cost !== undefined) {
+                console.log(`[NON-STREAM] 对话结束，成本: ${freeplayData.cost}`);
+                cost = freeplayData.cost;
+              }
+
+            } catch (error) {
+              console.log(`[NON-STREAM] JSON解析错误: ${error}, 行内容: ${trimmedLine}`);
+              continue;
             }
           }
         }
-      } finally {
-        reader.releaseLock();
       }
+    } finally {
+      reader.releaseLock();
+      console.log(`[NON-STREAM] 释放读取器锁`);
     }
+
+    // 处理缓冲区中剩余的数据
+    if (buffer.trim()) {
+      console.log(`[NON-STREAM] 处理缓冲区剩余数据: ${buffer.trim()}`);
+    }
+
+    console.log(`[NON-STREAM] 收集到的完整内容长度: ${fullContent.length} 字符`);
 
     // 对话结束后重新获取最新余额
     if (cost !== null) {
@@ -389,7 +514,7 @@ export async function generateOpenAINonStreamResponse(
     }
 
     // 返回OpenAI格式的完整响应
-    return {
+    const response_data = {
       id: `chatcmpl-${crypto.randomUUID().replace(/-/g, '').substring(0, 29)}`,
       object: "chat.completion",
       created: Math.floor(Date.now() / 1000),
@@ -409,7 +534,12 @@ export async function generateOpenAINonStreamResponse(
       }
     };
 
+    console.log(`[NON-STREAM] 返回响应，内容长度: ${fullContent.length}`);
+    return response_data;
+
   } catch (error) {
+    console.error(`[NON-STREAM] 处理错误: ${error}`);
+    console.error(`[NON-STREAM] 错误堆栈: ${error.stack}`);
     return {
       error: {
         message: `Processing error: ${error}`,
@@ -417,4 +547,4 @@ export async function generateOpenAINonStreamResponse(
       }
     };
   }
-} 
+}

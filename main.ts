@@ -4,6 +4,20 @@ import { AccountPool } from './account-pool.ts';
 import { generateOpenAIStreamResponse, generateOpenAINonStreamResponse } from './freeplay-api.ts';
 import { ConfigManager } from './config-manager.ts';
 
+// Deno类型声明
+declare global {
+  namespace Deno {
+    export const env: {
+      get(key: string): string | undefined;
+    };
+    export function serve(options: { port: number }, handler: (request: Request) => Response | Promise<Response>): any;
+  }
+
+  interface ImportMeta {
+    main: boolean;
+  }
+}
+
 // 初始化配置管理器和账号池
 const configManager = new ConfigManager();
 const accountPool = new AccountPool(configManager);
@@ -123,37 +137,52 @@ async function handleChatCompletions(request: Request, corsHeaders: Record<strin
     }
 
     if (stream) {
+      console.log(`[MAIN] 处理流式请求`);
       // 流式响应
-      const stream = new ReadableStream({
+      const responseStream = new ReadableStream({
         async start(controller) {
           const encoder = new TextEncoder();
+          console.log(`[MAIN] 开始流式响应控制器`);
+
           try {
+            let chunkCount = 0;
             for await (const chunk of generateOpenAIStreamResponse(accountPool, messages, model)) {
+              chunkCount++;
+              console.log(`[MAIN] 发送流式数据块 ${chunkCount}: ${chunk.length} 字符`);
               controller.enqueue(encoder.encode(chunk));
             }
+            console.log(`[MAIN] 流式响应完成，共发送 ${chunkCount} 个数据块`);
           } catch (error) {
+            console.error(`[MAIN] 流式响应错误: ${error}`);
             const errorChunk = `data: ${JSON.stringify({ error: { message: `Stream error: ${error}`, type: "internal_error" } })}\n\n`;
             controller.enqueue(encoder.encode(errorChunk));
           } finally {
+            console.log(`[MAIN] 关闭流式响应控制器`);
             controller.close();
           }
         }
       });
 
-      return new Response(stream, {
+      return new Response(responseStream, {
+        status: 200,
         headers: {
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache, no-store, must-revalidate',
           'Connection': 'keep-alive',
+          'X-Accel-Buffering': 'no', // 禁用Nginx缓冲
           ...corsHeaders
         }
       });
     } else {
+      console.log(`[MAIN] 处理非流式请求`);
       // 非流式响应
       const responseData = await generateOpenAINonStreamResponse(accountPool, messages, model);
+      console.log(`[MAIN] 非流式响应完成，数据大小: ${JSON.stringify(responseData).length} 字符`);
+
       return new Response(JSON.stringify(responseData), {
+        status: 200,
         headers: {
-          'Content-Type': 'application/json',
+          'Content-Type': 'application/json; charset=utf-8',
           ...corsHeaders
         }
       });
