@@ -1,0 +1,28 @@
+# Dash.deno.com 部署配置
+name: freeplay2openai-api
+description: FreePlay to OpenAI API Converter
+
+# 主入口文件
+main: main.ts
+
+# 环境变量
+env:
+  PORT: 8000
+
+# 所需权限
+permissions:
+  - net
+  - read
+  - write
+  - env
+
+# 部署前检查清单
+pre_deploy:
+  - 确保 accounts.txt 文件存在且格式正确
+  - 检查所有TypeScript文件无语法错误
+  - 验证模型配置正确
+
+# 健康检查端点
+health_check:
+  path: /test
+  expected_status: 200 
